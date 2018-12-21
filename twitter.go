@@ -12,6 +12,7 @@ import (
 	"github.com/dghubble/go-twitter/twitter"
 	"github.com/dghubble/oauth1"
 	"github.com/go-telegram-bot-api/telegram-bot-api"
+	"math"
 	"math/rand"
 	"strconv"
 	"time"
@@ -20,13 +21,16 @@ import (
 const dynamodbRegion = "eu-west-1"
 const dynamodbTable = "TwitterBot"
 
-const tgbotToken = "TOKEN"
+const tgbotToken = "PUT_TOKEN_HERE"
 const tgbotLogID = -170311435
+
+const SecurityThreshold = 5
 
 // Post structure for DynamoDB post table
 type TwitterBot struct {
-	ID        int     `json:"id"`
-	Followers []int64 `json:"followers"`
+	ID         int     `json:"id"`
+	ScreenName string  `json:"screenname"`
+	Followers  []int64 `json:"followers"`
 }
 
 // Structure for credentials
@@ -41,28 +45,7 @@ type Credentials struct {
 }
 
 var twitterAccounts = []Credentials{
-	{
-		"",
-		"",
-		"",
-		"",
-		true,
-		true,
-		[]string{
-			"Hola!",
-		},
-	},
-	{
-		"",
-		"",
-		"",
-		"",
-		true,
-		true,
-		[]string{
-			"Hola!",
-		},
-	},
+ // PUT CREDENTIALS HERE
 }
 
 func tglog(message string) {
@@ -95,6 +78,7 @@ func process() {
 		client := twitter.NewClient(httpClient)
 
 		user, _, err := client.Accounts.VerifyCredentials(&twitter.AccountVerifyParams{})
+		tglog(fmt.Sprintf("Twitter check para %v", user.ScreenName))
 		if err == nil {
 			// Check if account is already there, otherwise launch initial import
 			result, _ := svc.GetItem(&dynamodb.GetItemInput{
@@ -109,10 +93,15 @@ func process() {
 			tw := TwitterBot{}
 			err = dynamodbattribute.UnmarshalMap(result.Item, &tw)
 
-			followerIDs, _, _ := client.Followers.IDs(&twitter.FollowerIDParams{Count: 1000000})
+			followerIDs, _, _ := client.Followers.IDs(&twitter.FollowerIDParams{Count: 5000})
+			arrayOfIDS := followerIDs.IDs
+			for followerIDs.NextCursor != 0 {
+				followerIDs, _, _ = client.Followers.IDs(&twitter.FollowerIDParams{Count: 5000, Cursor: followerIDs.NextCursor})
+				arrayOfIDS = append(arrayOfIDS, followerIDs.IDs...)
+			}
 
 			if tw.ID != int(user.ID) {
-				tw := TwitterBot{int(user.ID), followerIDs.IDs}
+				tw := TwitterBot{int(user.ID), user.ScreenName, arrayOfIDS}
 				av, _ := dynamodbattribute.MarshalMap(tw)
 				input := &dynamodb.PutItemInput{
 					Item:      av,
@@ -120,11 +109,14 @@ func process() {
 				}
 				_, err = svc.PutItem(input)
 			} else {
-				if twitterAccount.followBack {
-					for _, follower := range followerIDs.IDs {
+				diff := math.Abs(float64(len(arrayOfIDS) - len(tw.Followers)))
+				if diff < SecurityThreshold {
+					for _, follower := range arrayOfIDS {
 						if !inArray(follower, tw.Followers) {
 							tglog(fmt.Sprintf("New follower %v para %v\n", follower, user.ScreenName))
-							client.Friendships.Create(&twitter.FriendshipCreateParams{UserID: follower})
+							if twitterAccount.followBack {
+								client.Friendships.Create(&twitter.FriendshipCreateParams{UserID: follower})
+							}
 							if len(twitterAccount.greetings) > 0 {
 								nfollower, _, _ := client.Users.Show(&twitter.UserShowParams{UserID: follower})
 								rand.Seed(time.Now().UnixNano())
@@ -132,22 +124,24 @@ func process() {
 							}
 						}
 					}
-				}
-				if twitterAccount.unfollowback {
 					for _, follower := range tw.Followers {
-						if !inArray(follower, followerIDs.IDs) {
+						if !inArray(follower, arrayOfIDS) {
 							tglog(fmt.Sprintf("New unfollower %v para %v\n", follower, user.ScreenName))
-							client.Friendships.Destroy(&twitter.FriendshipDestroyParams{UserID: follower})
+							if twitterAccount.unfollowback {
+								client.Friendships.Destroy(&twitter.FriendshipDestroyParams{UserID: follower})
+							}
 						}
 					}
+					tw := TwitterBot{int(user.ID), user.ScreenName, arrayOfIDS}
+					av, _ := dynamodbattribute.MarshalMap(tw)
+					input := &dynamodb.PutItemInput{
+						Item:      av,
+						TableName: aws.String(dynamodbTable),
+					}
+					_, err = svc.PutItem(input)
+				} else {
+					tglog("Number of new followers/unfollowers above threshold. Skipping")
 				}
-				tw := TwitterBot{int(user.ID), followerIDs.IDs}
-				av, _ := dynamodbattribute.MarshalMap(tw)
-				input := &dynamodb.PutItemInput{
-					Item:      av,
-					TableName: aws.String(dynamodbTable),
-				}
-				_, err = svc.PutItem(input)
 			}
 		}
 	}
